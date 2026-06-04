@@ -96,16 +96,28 @@ export default function TimerStage({
   const [playing,   setPlaying]   = useState(false);
   const [message,   setMessage]   = useState("");
 
+  // Viewer-mode: store active item received from server
+  const [viewerItem, setViewerItem] = useState(null);
+
   const intervalRef = useRef(null);
 
-  // ── Reset when active item changes ───────────────────────────────────────────
+  // ── Reset + sync when active item changes (controller only) ──────────────────
   useEffect(() => {
+    if (!isController) return;
     const secs = activeItem ? parseMMSS(activeItem.duration) : 300;
     totalRef.current = secs;
     setTotal(secs);
     setRemaining(secs);
     setPlaying(false);
     clearInterval(intervalRef.current);
+    // Tell server (and all viewers) about the new active item immediately
+    if (socket) {
+      socket.emit("syncState", {
+        remainingSeconds: secs,
+        totalSeconds:     secs,
+        activeItem:       activeItem ?? { id: null, title: "Standby", speaker: "", duration: "00:00" },
+      });
+    }
   }, [activeId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Tick ─────────────────────────────────────────────────────────────────────
@@ -129,9 +141,10 @@ export default function TimerStage({
   // ── Socket listener (Viewer mode) ────────────────────────────────────────────
   useEffect(() => {
     if (!socket || isController) return;
-    const handler = ({ remainingSeconds, totalSeconds }) => {
-      if (totalSeconds !== undefined) { totalRef.current = totalSeconds; setTotal(totalSeconds); }
-      setRemaining(remainingSeconds);
+    const handler = ({ remainingSeconds, totalSeconds, activeItem: ai }) => {
+      if (totalSeconds  !== undefined) { totalRef.current = totalSeconds; setTotal(totalSeconds); }
+      if (remainingSeconds !== undefined) setRemaining(remainingSeconds);
+      if (ai            !== undefined) setViewerItem(ai);
     };
     socket.on("timerUpdate", handler);
     return () => socket.off("timerUpdate", handler);
@@ -185,45 +198,43 @@ export default function TimerStage({
   const isOvertime = remaining < 0;
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // VIEWER mode — minimal fullscreen display
+  // VIEWER mode — mirrors controller centre stage, no transport controls
   // ─────────────────────────────────────────────────────────────────────────────
+  // In viewer mode, use item info pushed from server
+  const displayItem = isController ? activeItem : viewerItem;
+
   if (!isController) {
     return (
       <div style={v.wrap}>
-        {/* Session label */}
-        {activeItem && (
-          <div style={v.sessionLabel}>{activeItem.title}</div>
-        )}
 
-        {/* Big clock */}
-        <div style={{ ...v.clock, color: timerColor, animation: phase === "danger" || phase === "overtime" ? "vFlicker 1s ease-in-out infinite" : "none" }}>
+        {/* Session info */}
+        <div style={v.sessionLabel}>
+          <span style={v.sessionLine} />
+          Now running
+          <span style={v.sessionLine} />
+        </div>
+        <div style={v.title}>{displayItem?.title ?? "Standby"}</div>
+        {displayItem?.speaker && <div style={v.speaker}>{displayItem.speaker}</div>}
+
+        {/* Timer digits */}
+        <div style={{
+          ...v.timerDisplay,
+          color: timerColor,
+          animation: phase === "danger" || phase === "overtime"
+            ? "vFlicker 1s ease-in-out infinite" : "none",
+        }}>
           {fmtMMSS(remaining)}
         </div>
 
-        {/* Progress bar — colour segments */}
-        <div style={v.barWrap}>
-          {/* Colour zones */}
-          <div style={{ ...v.barZone, width: "85%", background: "#4ade80" }} />
-          <div style={{ ...v.barZone, width: "10%", background: "#fbbf24", left: "85%" }} />
-          <div style={{ ...v.barZone, width: "5%",  background: "#f87171", left: "95%" }} />
-          {/* Elapsed mask */}
-          <div style={{ ...v.barMask, width: `${100 - pct}%` }} />
-          {/* Playhead triangle */}
-          <div style={{ ...v.playhead, left: `calc(${pct}% - 12px)` }}>
-            <svg width="24" height="24" viewBox="0 0 24 24" style={{ overflow: "visible" }}>
-              <polygon points="12,24 0,0 24,0" fill="white" stroke="#181716" strokeWidth="2.5" strokeLinejoin="round" />
-            </svg>
-          </div>
+        {/* Overtime badge */}
+        {isOvertime && <div style={v.overtimeBadge}>OVERTIME</div>}
+
+        {/* Progress bar */}
+        <div style={v.progressWrap}>
+          <div style={{ ...v.progressBar, width: `${pct}%`, background: barColor }} />
         </div>
 
-        {/* Speaker */}
-        {activeItem?.speaker && (
-          <div style={v.speaker}>{activeItem.speaker}</div>
-        )}
-
-        <style>{`
-          @keyframes vFlicker { 0%,100%{opacity:1} 50%{opacity:0.82} }
-        `}</style>
+        <style>{`@keyframes vFlicker{0%,100%{opacity:1}50%{opacity:0.82}}`}</style>
       </div>
     );
   }
@@ -566,72 +577,83 @@ const c = {
   },
 };
 
-// ─── Viewer styles ────────────────────────────────────────────────────────────
+// ─── Viewer styles — mirrors controller centre stage ──────────────────────────
 
 const v = {
   wrap: {
     width: "100vw",
     height: "100vh",
-    background: "#181716",
+    background: "#0a0a0b",
     display: "flex",
     flexDirection: "column",
     alignItems: "center",
-    justifyContent: "space-between",
+    justifyContent: "center",
     overflow: "hidden",
     userSelect: "none",
-    fontFamily: "Inter, Arial, sans-serif",
+    gap: 6,
+    padding: "24px 32px",
+    boxSizing: "border-box",
   },
   sessionLabel: {
-    paddingTop: "2vw",
-    fontSize: "clamp(14px, 1.8vw, 22px)",
-    fontWeight: 600,
-    color: "#6ec1f6",
-    letterSpacing: 0,
-  },
-  clock: {
-    fontSize: "19vw",
-    fontWeight: 800,
-    lineHeight: 1,
-    letterSpacing: 0,
-    textAlign: "center",
-    fontFamily: "Inter, Arial, sans-serif",
-    transition: "color 0.4s",
-    flex: 1,
+    fontSize: 11,
+    fontWeight: 500,
+    textTransform: "uppercase",
+    letterSpacing: "0.10em",
+    color: "rgba(240,240,240,0.38)",
     display: "flex",
     alignItems: "center",
+    gap: 8,
+  },
+  sessionLine: {
+    display: "block",
+    height: 1,
+    width: 24,
+    background: "rgba(255,255,255,0.12)",
+  },
+  title: {
+    fontSize: "clamp(20px, 3vw, 36px)",
+    fontWeight: 600,
+    color: "#f0f0f0",
+    letterSpacing: "-0.02em",
+    marginTop: 3,
+    textAlign: "center",
   },
   speaker: {
-    fontSize: "clamp(12px, 1.4vw, 20px)",
-    color: "rgba(255,255,255,0.45)",
-    paddingBottom: "2vw",
+    fontSize: "clamp(13px, 1.6vw, 20px)",
+    color: "rgba(240,240,240,0.6)",
+    textAlign: "center",
   },
-  barWrap: {
-    position: "relative",
+  timerDisplay: {
+    fontFamily: "'Geist Mono', 'DM Mono', monospace",
+    fontSize: "clamp(80px, 16vw, 180px)",
+    fontWeight: 300,
+    letterSpacing: "-0.04em",
+    lineHeight: 1,
+    margin: "18px 0 6px",
+    transition: "color 0.4s",
+  },
+  overtimeBadge: {
+    fontSize: 13,
+    fontWeight: 700,
+    letterSpacing: "0.12em",
+    color: "#f87171",
+    background: "rgba(248,113,113,0.12)",
+    border: "1px solid rgba(248,113,113,0.25)",
+    padding: "4px 14px",
+    borderRadius: 20,
+  },
+  progressWrap: {
     width: "100%",
-    height: "10vw",
-    minHeight: 60,
-    maxHeight: 140,
-    background: "#181716",
-    flexShrink: 0,
+    maxWidth: 600,
+    height: 4,
+    background: "#1f1f25",
+    borderRadius: 2,
+    overflow: "hidden",
+    marginTop: 8,
   },
-  barZone: {
-    position: "absolute",
-    top: 0,
+  progressBar: {
     height: "100%",
-  },
-  barMask: {
-    position: "absolute",
-    right: 0,
-    top: 0,
-    height: "100%",
-    background: "#232420",
-    transition: "width 0.3s cubic-bezier(.4,0,.2,1)",
-    zIndex: 2,
-  },
-  playhead: {
-    position: "absolute",
-    top: 0,
-    zIndex: 10,
-    transition: "left 0.3s cubic-bezier(.4,0,.2,1)",
+    borderRadius: 2,
+    transition: "width 1s linear, background 0.4s",
   },
 };
